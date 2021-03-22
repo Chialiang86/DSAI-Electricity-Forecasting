@@ -13,7 +13,8 @@ from keras.callbacks import EarlyStopping, ModelCheckpoint
 
 # raw data loading
 def readCSV(fname):
-    df = pd.read_csv(fname, usecols=['淨尖峰供電能力(MW)', '尖峰負載(MW)', '備轉容量(MW)', '備轉容量率(%)', 'temp_high', 'temp_low'])
+    # df = pd.read_csv(fname, usecols=['淨尖峰供電能力(MW)', '尖峰負載(MW)', '備轉容量(MW)', '備轉容量率(%)', 'temp_high', 'temp_low'])
+    df = pd.read_csv(fname, usecols=['備轉容量(MW)', '備轉容量率(%)', 'temp_high', 'temp_low'])
     date_format = pd.read_csv(fname, usecols=['日期'])
     for i in range(date_format.__len__()):
         day = date_format.values[i]
@@ -34,24 +35,19 @@ def normalize(data):
 
 # use the number of ref_day's data to predict the number of predict_day's data
 # split training/testing data by 'ratio' parameter
-def setTrainTestData(data, ref_day, predict_day, ratio=0.9):
+def setTrainTestData(data, ref_day, predict_day):
     x, y = [], []
     for i in range(len(data) - ref_day - predict_day):
         x.append(np.array(data.iloc[i:i + ref_day]))
         y.append(np.array(data.iloc[i + ref_day:i + ref_day + predict_day]['備轉容量(MW)']))
     x,y = np.array(x), np.array(y)
-    x_train = x[:int(x.shape[0] * ratio)]
-    x_test = x[int(x.shape[0] * ratio):]
-    y_train = y[:int(y.shape[0] * ratio)]
-    y_test = y[int(y.shape[0] * ratio):]
-    return x_train, x_test, y_train, y_test
+    return x, y
 
 # use the latest ref_day's data as the input data of 7 days(2021/03/23 - 2021/03/29) prediction
 def setPredictInput(data, ref_day, min, range):
     x = []
     x.append(np.array(data.iloc[len(data) - ref_day:]))
     data = data[len(data) - ref_day:]['備轉容量(MW)'][:] * range + min
-    print(data)
     return np.array(x)
 
 # use random to reorder data
@@ -66,18 +62,19 @@ def buildManyToManyModel(shape, batch_size):
     model = Sequential()
     model.add(LSTM(64, input_shape=(shape[1], shape[2]), return_sequences = True))
     model.add(Dropout(0.2))
+
+    # Adding a second LSTM layer and some Dropout regularisation
+    model.add(LSTM(64, return_sequences=True))
+    model.add(Dropout(0.2))
+    
     # # Adding a second LSTM layer and some Dropout regularisation
     # model.add(LSTM(64, return_sequences=True))
     # model.add(Dropout(0.2))
-    
-    # # Adding a third LSTM layer and some Dropout regularisation
-    # model.add(LSTM(64, return_sequences = True))
-    # model.add(Dropout(0.2))
-    
+
     # Adding a fourth LSTM layer and some Dropout regularisation
     model.add(TimeDistributed(Dense(units = 1)))
     model.add(Flatten())
-    model.add(Dense(64, activation='linear'))
+    model.add(Dense(64, activation='sigmoid'))
     # output 7-days prediction of 備轉容量(MW)
     model.add(Dense(7))
     model.compile(loss="mse", optimizer="adam", metrics=['mse'])
@@ -118,58 +115,92 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--training',
                        default='training_data.csv',
-                       help='input training data file name')
+                       help='input training data file name(.csv)')
+    
+    parser.add_argument('--testing',
+                       default=False,
+                       help='input trained model file name(.h5)')
 
     parser.add_argument('--output',
                         default='submission.csv',
-                        help='output file name')
+                        help='output file name(.csv)')
     args = parser.parse_args()
+
 
     # important arguments
     batch_size = 64
-    ref_day = 30
+    ref_day = 60
     predict_day = 7
-    train_ratio = 0.85
-    epoch = 500
-    patience = 50
+    train_ratio = 0.9
+    epoch = 100
+    patience = 20
 
     # data loading and preprocessing
     train_data = readCSV(args.training)
     min_, max_, range_ = np.min(train_data['備轉容量(MW)']), np.max(train_data['備轉容量(MW)']), (np.max(train_data['備轉容量(MW)']) - np.min(train_data['備轉容量(MW)']))
     data_norm = normalize(train_data)
-    x_train, x_test, y_train, y_test = setTrainTestData(data_norm, ref_day, predict_day, train_ratio)
-    x_train, y_train = shuffle(x_train, y_train)
-    x_test, y_test = shuffle(x_test, y_test)
+    # data_norm['month'] *= 1.5
+    # data_norm['dayOfWeek'] *= 2
+    data_norm['temp_high'] *= 1.5
+    data_norm['temp_low'] *= 1.5
+    x, y = setTrainTestData(data_norm, ref_day, predict_day)
+    x_train, y_train = shuffle(x[:int(x.shape[0] * train_ratio)], y[:int(y.shape[0] * train_ratio)])
+    x_test, y_test = shuffle(x[int(x.shape[0] * train_ratio):], y[int(y.shape[0] * train_ratio):])
 
-    # build model, use EarlyStopping with validation mse monitor as callbacks
-    model = buildManyToManyModel(x_train.shape, batch_size)
-    early_stopping = EarlyStopping(monitor='val_mse', patience=patience, verbose=1, mode='min')
-    history = model.fit(x_train, y_train, verbose=1, callbacks=[early_stopping],\
-        validation_data=(x_test, y_test), batch_size=batch_size, epochs=epoch)
+    # testing prediction by good model ''
+    if args.testing:
+        model = keras.models.load_model('weights-80-0.0006.h5')
+        predict_target = setPredictInput(data_norm, ref_day, min_, range_)
+        df_result = model.predict(predict_target)[0]
+        df_result = np.round(df_result[:] * range_ + min_, decimals=2)
 
-    lossDump(history.history)
+        x_dump = x[-10:]
+        y_dump = y[-10:]
+        y_predict_dump = model.predict(x_dump)
+        y_dump = y_dump[:] * range_ + min_
+        y_predict_dump = y_predict_dump[:] * range_ + min_
+        predictTestDump(y_predict_dump, y_dump)
 
-    # predict 10 data and plot the prediction result to check whether the model was well trained
-    x_dump = x_test[:10]
-    y_dump = y_test[:10]
-    y_predict_dump = model.predict(x_dump)
-    y_dump = y_dump[:] * range_ + min_
-    y_predict_dump = y_predict_dump[:] * range_ + min_
-    predictTestDump(y_predict_dump, y_dump)
+        predict_dict = {}
+        predict_dict['date'] = ['20210323', '20210324', '20210325', '20210326', '20210327', '20210328', '20210329']
+        predict_dict['operating_reserve(MW)'] = df_result
+        df = pd.DataFrame(predict_dict, columns= ['date', 'operating_reserve(MW)'])
+        df.to_csv ('submission.csv', index = False, header=True)
+        print (df)
 
-    # use the latest data to predict the follow 7 days' 備轉容量(MW)
-    predict_target = setPredictInput(data_norm, ref_day, min_, range_)
-    df_result = model.predict(predict_target)[0]
-    df_result = np.round(df_result[:] * range_ + min_, decimals=2)
+    else :
 
-    # write prediction result to csv file
-    predict_dict = {}
-    predict_dict['date'] = ['20210323', '20210324', '20210325', '20210326', '20210327', '20210328', '20210329']
-    predict_dict['operating_reserve(MW)'] = df_result
-    df = pd.DataFrame(predict_dict, columns= ['date', 'operating_reserve(MW)'])
-    df.to_csv (args.output, index = False, header=True)
-    print (df)
+        # build model, use EarlyStopping with val_mse monitor as callbacks
+        model = buildManyToManyModel(x_train.shape, batch_size)
+        # early_stopping = EarlyStopping(monitor='val_mse', patience=patience, verbose=1, mode='min')
+        filepath="weights-{epoch:02d}-{val_mse:.4f}.h5"
+        checkpoint = ModelCheckpoint(filepath, monitor='val_mse', verbose=1, save_best_only=True, mode='min')
+        history = model.fit(x_train, y_train, verbose=1, callbacks=[checkpoint],\
+            validation_data=(x_test, y_test), batch_size=batch_size, epochs=epoch)
 
-    # save model
-    save_name = '{}_{}.h5'.format(int(time.time()), np.around(np.min(history.history['val_mse']), decimals=4))
-    model.save(save_name)
+        lossDump(history.history)
+
+        # predict 10 data and plot the prediction result to check whether the model was well trained
+        x_dump = x[-10:]
+        y_dump = y[-10:]
+        y_predict_dump = model.predict(x_dump)
+        y_dump = y_dump[:] * range_ + min_
+        y_predict_dump = y_predict_dump[:] * range_ + min_
+        predictTestDump(y_predict_dump, y_dump)
+
+        # use the latest data to predict the follow 7 days' 備轉容量(MW)
+        predict_target = setPredictInput(data_norm, ref_day, min_, range_)
+        df_result = model.predict(predict_target)[0]
+        df_result = np.round(df_result[:] * range_ + min_, decimals=2)
+
+        # write prediction result to csv file
+        predict_dict = {}
+        predict_dict['date'] = ['20210323', '20210324', '20210325', '20210326', '20210327', '20210328', '20210329']
+        predict_dict['operating_reserve(MW)'] = df_result
+        df = pd.DataFrame(predict_dict, columns= ['date', 'operating_reserve(MW)'])
+        df.to_csv (args.output, index = False, header=True)
+        print (df)
+
+        # save model
+        save_name = '{}_{}.h5'.format(int(time.time()), np.around(np.min(history.history['val_mse']), decimals=4))
+        model.save(save_name)
